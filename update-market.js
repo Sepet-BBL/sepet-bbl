@@ -1,103 +1,115 @@
-const admin = require("firebase-admin");
-const axios = require("axios");
-const { schedule } = require("@netlify/functions");
+const axios = require('axios');
+const admin = require('firebase-admin');
 
-// Firebase Ayarları (Netlify Panelinden Okuyacak)
+// Firebase Ayarları
 const serviceAccount = {
-  type: "service_account",
-  project_id: process.env.FIREBASE_PROJECT_ID,
-  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  // Özel anahtardaki satır sonu karakterlerini düzeltiyoruz
-  private_key: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined,
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-  client_id: process.env.FIREBASE_CLIENT_ID,
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token",
-  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  privateKey: process.env.FIREBASE_PRIVATE_KEY 
+    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') 
+    : undefined,
 };
 
-// Firebase'i Başlat
 if (!admin.apps.length) {
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  } catch (error) {
-    console.error("Firebase başlatma hatası:", error);
-  }
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
 }
 
 const db = admin.firestore();
 
-// Ana Bot Fonksiyonu
-const handler = async (event, context) => {
-  console.log("🌍 Borsa Güncellemesi Başlıyor...");
-  
-  // EODHD API Token (Netlify Panelinden)
-  const EODHD_TOKEN = process.env.EODHD_API_TOKEN;
-  // BIST (Istanbul) Borsası için Bulk Data URL'i
-  const URL = `https://eodhd.com/api/eod-bulk-last-day/IS?api_token=${EODHD_TOKEN}&fmt=json`;
-
+exports.handler = async (event, context) => {
   try {
-    // 1. EODHD'den Veriyi Çek
-    const response = await axios.get(URL);
-    const data = response.data;
+    const apiToken = process.env.EODHD_API_TOKEN;
+    if (!apiToken) throw new Error("API Token bulunamadı!");
 
-    if (!data || data.length === 0) {
-      console.log("Veri alınamadı veya borsa kapalı.");
-      return { statusCode: 500 };
+    console.log("🌍 Borsa İstanbul Listesi Çekiliyor...");
+
+    // ADIM 1: Tüm Borsa İstanbul (IS) Şirketlerini Otomatik Çek
+    // Bu link, o an borsada olan tüm şirketleri listeler (Halka arzlar dahil).
+    const listUrl = `https://eodhd.com/api/exchanges/IS?api_token=${apiToken}&fmt=json`;
+    const listResponse = await axios.get(listUrl);
+    
+    // Sadece "Common Stock" (Hisse Senedi) olanları al, fonları vb. ele.
+    const allSymbols = listResponse.data
+        .filter(item => item.Type === 'Common Stock')
+        .map(item => item.Code); // Sadece kodları al (Örn: THYAO, GARAN)
+
+    console.log(`📋 Toplam ${allSymbols.length} adet hisse bulundu.`);
+
+    // ADIM 2: Listeyi 30'arlı Paketlere Böl (URL çok uzamasın diye)
+    const chunkSize = 30;
+    const chunks = [];
+    for (let i = 0; i < allSymbols.length; i += chunkSize) {
+      chunks.push(allSymbols.slice(i, i + chunkSize));
     }
 
-    console.log(`📦 ${data.length} adet hisse verisi alındı. İşleniyor...`);
+    console.log(`📦 İşlem ${chunks.length} pakete bölündü, veriler çekiliyor...`);
 
-    // 2. Firebase'e Yaz (Batch işlemi ile - 500'erli gruplar halinde)
-    const batch = db.batch();
-    let counter = 0;
+    let totalUpdated = 0;
+    const batch = db.batch(); // Firestore Toplu Yazma
     let batchCount = 0;
 
-    for (const stock of data) {
-      // Filtreleme: Fiyatı 0.1 altındakileri veya işlem görmeyenleri alma
-      if (stock.close < 0.1) continue;
-
-      const symbol = stock.code; // Örn: THYAO
-      const docRef = db.collection('sepet').doc(symbol);
-
-      // Veriyi Hazırla
-      batch.set(docRef, {
-        transfer_degeri: stock.close, // Güncel Fiyat
-        temel_puan: stock.change_p || 0, // Günlük % Değişim (Puan olarak kullanıyoruz)
-        // Eğer hakkında kısmı boşsa doldur, doluysa elleme (merge:true sayesinde)
-        // son_guncelleme: admin.firestore.FieldValue.serverTimestamp()
-      }, { merge: true });
-
-      counter++;
-
-      // Firestore Batch Limiti (400'de bir gönder)
-      if (counter >= 400) {
-        await batch.commit();
-        console.log(`💾 Grup ${++batchCount} kaydedildi.`);
-        counter = 0;
-        // Not: Normalde batch yeniden oluşturulmalı ama serverless ortamda
-        // tek seferlik döngüde commit sonrası devam edebiliriz.
+    // Tüm paketleri aynı anda iste (Hızlandırmak için)
+    const promises = chunks.map(async (chunk) => {
+      const first = chunk[0];
+      const others = chunk.slice(1).join(',');
+      // Real-Time API ile çoklu sorgu
+      const url = `https://eodhd.com/api/real-time/${first}?api_token=${apiToken}&s=${others}&fmt=json`;
+      
+      try {
+        const res = await axios.get(url);
+        return Array.isArray(res.data) ? res.data : [res.data];
+      } catch (err) {
+        console.error(`⚠️ Paket hatası: ${err.message}`);
+        return [];
       }
-    }
+    });
 
-    // Kalanları gönder
-    if (counter > 0) {
+    // API Yanıtlarını Bekle
+    const results = await Promise.all(promises);
+    const allStocksData = results.flat(); // Gelen verileri tek listede birleştir
+
+    // ADIM 3: Veritabanına Kaydet
+    allStocksData.forEach(stock => {
+      const rawCode = stock.code || stock.Code;
+      if (!rawCode) return;
+      
+      const symbol = rawCode.split('.')[0]; // "THYAO.IS" -> "THYAO" yap
+      const price = stock.close || stock.Close || stock.previousClose;
+      const date = new Date().toISOString().split('T')[0];
+
+      if (price) {
+        const docRef = db.collection('sepet').doc(symbol);
+        batch.set(docRef, {
+          symbol: symbol,
+          fiyat: parseFloat(price),
+          sonGuncelleme: date,
+          timestamp: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        
+        batchCount++;
+        totalUpdated++;
+      }
+    });
+
+    // Veritabanına "Commit" et (Yaz)
+    if (batchCount > 0) {
       await batch.commit();
-      console.log("💾 Son parça kaydedildi.");
     }
 
-    console.log("✅ GÜNCELLEME BAŞARIYLA TAMAMLANDI.");
-    return { statusCode: 200 };
+    console.log(`✅ Başarılı! Toplam ${totalUpdated} hisse güncellendi.`);
+    
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ message: "Otomatik Güncelleme Tamamlandı", count: totalUpdated })
+    };
 
   } catch (error) {
-    console.error("Hata oluştu:", error);
-    return { statusCode: 500 };
+    console.error("❌ Kritik Hata:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: error.message })
+    };
   }
 };
-
-// Zamanlama Ayarı: Hafta içi her gün 18:30 (Türkiye Saati)
-// Cron: "30 15 * * 1-5" (UTC saatiyle 15:30 = TR saatiyle 18:30)
-module.exports.handler = schedule("30 15 * * 1-5", handler);
