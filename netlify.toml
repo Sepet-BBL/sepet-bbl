@@ -1,5 +1,5 @@
 [build]
   functions = "netlify/functions"
 
-[functions]
-  node_bundler = "esbuild"
+[functions."update-market"]
+  schedule = "30 9-18 * * 1-5"
