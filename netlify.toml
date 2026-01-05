@@ -1,5 +1,0 @@
-[build]
-  functions = "netlify/functions"
-
-[functions."update-market"]
-  schedule = "30 9-18 * * 1-5"
